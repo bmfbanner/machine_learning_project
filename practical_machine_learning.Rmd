@@ -1,0 +1,135 @@
+---
+title: "Practical Machine Learning Project"
+author: "Jesse Dixon"
+date: "8/28/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(caret)
+library(caretEnsemble)
+library(skimr)
+library(parallel)
+library(doParallel)
+library(arsenal)
+library(tidyverse)
+set.seed(333)
+pml.testing <- read.csv("/home/m141306/ibm/pml-testing.csv", na.strings=c("NA", "", " ", "#DIV/0!"), stringsAsFactors=TRUE)
+pml.training <- read.csv("/home/m141306/ibm/pml-training.csv", na.strings=c("NA", "", " ", "#DIV/0!"), stringsAsFactors=TRUE)
+```
+
+## Dividing Data
+
+The very first thing that I did was to split the dataset into 3 sections: Training (75%), Testing (20%), and Validation (5%). I will use the training dataset to create my initial models. Then I will use the testing dataset to test the model fit and then create my ensemble model. I will then use the validation set to assess the accuracy of my ensemble model.
+
+```{r}
+intrain<-createDataPartition(y=pml.training$classe, p=.75,list=FALSE)
+train<-pml.training[intrain,]
+test<-pml.training[-intrain,]
+inval<-createDataPartition(y=test$classe, p=.25,list=FALSE)
+val<-test[inval,]
+test<-test[-inval,]
+```
+
+## Data PreProcessing
+
+Looking through the different variables in the dataset, I found 3 variables (X, user_name, cvtd_timestamp) that would likely not add any information to my model. So, I removed them from the featur selection. Then, I looked at the descriptive statistics of the remaining variables, and I noticed that there were a large number of variables that were mostly missing. Since I do not want to impute over 95% of the observations for these variables, I decided to also exclude them from my feature selection. I then used the preProcess function from the caret package to remove columns with zero and near-zero variance and then center and scale my numeric variables. I then looked at the descriptive statistics of the new new dataset and decided to include all remaining variables as features in my model building.
+
+```{r}
+train2<-train[,colSums(is.na(train))/nrow(train)<0.9, drop=FALSE]
+train3<-select(train2,-c(X,user_name,cvtd_timestamp))
+train.pp<-preProcess(train3, method=c("center", "scale", "zv", "nzv"))
+new.train<-predict(train.pp,newdata=train3)
+skim(new.train)
+```
+
+## Train Models
+
+My next step was to train the potential models and adjust the tuning parameters. I decided to consider a few of the types that we discussed in class. The model types that I considered were Stochastic Gradient Boosting, Random Forest, k-Nearest Neighbors, and Regularized Generalized Linear Models. I will train my models using 5-fold cross-validation in order to reduce overfitting. For each model type, I used the expand.grid and ggplot functions to test out different values of tuning parameters and to plot the accuracy of each model for the different tuning parameter values [due to the long processing time, I did not include these steps in the Rmarkdown document]. I then chose the "best" values of these parameters for my model based on which values gave the best accuracy while trying for the least complicated model.
+
+```{r}
+cluster <- makeCluster(10)
+registerDoParallel(cluster)
+fitControl <- trainControl(method = "cv",number = 5,allowParallel = TRUE)
+
+##Stochastic Gradiant Boosting
+gbmGrid<-expand.grid(interaction.depth=2, n.trees=10, shrinkage=.3, n.minobsinnode=20)
+gbm<-train(classe~.,data=new.train,method="gbm",trControl=fitControl, tuneGrid=gbmGrid)
+
+##Random Forest
+rfGrid<-expand.grid(mtry=3)
+rf<-train(classe~.,data=new.train, method="rf",trControl=fitControl, tuneGrid=rfGrid)
+
+##k-Nearest Neighbors
+knnGrid<-expand.grid(k=3)
+knn<-train(classe~.,data=new.train, method="knn",trControl=fitControl, tuneGrid=knnGrid)
+
+##Generalized Linear Model
+glmGrid<-expand.grid(alpha=.5)
+glm<-train(classe~.,data=new.train, method="glmnet",trControl=fitControl)
+
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+## Check Model Performances
+
+Then, I assessed each of the models for accuracy using the predict and confusionMatrix functions. The accuracy of the GLM model was the worst, but was still quite a bit better than a random draw with an accuracy of 0.74. The GBM model did better with an accuracy of 0.88. The random forest model and the k-nearest neighbors model did the best with an accuracy of .997 and .98 respectively. I decided that all 4 of the models were sufficient to be used in a final ensemble model.
+
+```{r}
+##Do Preproduction for training and validation sets
+new.test<-predict(train.pp,newdata=test)
+new.val<-predict(train.pp,newdata=val)
+
+##Predictions for Test Data
+gbm.p<-predict(gbm,newdata=new.test)
+rf.p<-predict(rf,newdata=new.test)
+knn.p<-predict(knn,newdata=new.test)
+glm.p<-predict(glm,newdata=new.test)
+
+##Confusion Matrices
+confusionMatrix(new.test$classe,gbm.p)
+confusionMatrix(new.test$classe,rf.p)
+confusionMatrix(new.test$classe,knn.p)
+confusionMatrix(new.test$classe,glm.p)
+```
+
+## Create an Ensemble Model
+
+I then used all four of the preliminary models to create my final ensemble model. I used the test data to create this model by taking the predictions from the preliminary models and combining them to train a random forest model to come up with a final prediction based on the outcomes of the four preliminary models. I then used the validation dataset that I had set aside in order to estimate my final out of sample accuracy. This ensemble model performed exceedingly well with an accuracy of 0.998.
+
+```{r}
+##Create Ensemble Model
+ens.dat<-data.frame(gbm.p,rf.p,knn.p,glm.p,classe=new.test$classe)
+ens<-train(classe~., data=ens.dat,method="rf",trControl=fitControl)
+ens.p<-predict(ens,newdata=ens.dat)
+
+##Validation Predictions of Ensemble Model
+gbm.vp<-predict(gbm,newdata=new.val)
+rf.vp<-predict(rf,newdata=new.val)
+knn.vp<-predict(knn,newdata=new.val)
+glm.vp<-predict(glm,newdata=new.val)
+ens.dat.vp<-data.frame(gbm.p=gbm.vp,rf.p=rf.vp,knn.p=knn.vp,glm.p=glm.vp,classe=new.val$classe)
+ens.vp<-predict(ens,newdata=ens.dat.vp)
+
+##Confusion Matrix
+confusionMatrix(new.val$classe,ens.vp)
+```
+
+## Quiz Predictions
+
+I then used this final model to predict the values from the pml.testing dataset to be used on the quiz.
+
+```{r}
+##Prepare Quiz Data
+quiz<-predict(train.pp,newdata=pml.testing)
+
+##Quiz Predictions
+gbm.qp<-predict(gbm,newdata=quiz)
+rf.qp<-predict(rf,newdata=quiz)
+knn.qp<-predict(knn,newdata=quiz)
+glm.qp<-predict(glm,newdata=quiz)
+ens.dat.qp<-data.frame(gbm.p=gbm.qp,rf.p=rf.qp,knn.p=knn.qp,glm.p=glm.qp)
+ens.qp<-predict(ens,newdata=ens.dat.qp)
+print(ens.qp)
+```
